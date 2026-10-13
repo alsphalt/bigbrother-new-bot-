@@ -179,6 +179,6 @@
   },
   "version": "L2",
   "menu": {
-    "mode": "legacy"
+    "mode": "interactive"
   }
 }
