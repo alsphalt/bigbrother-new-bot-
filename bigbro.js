@@ -1,7 +1,7 @@
 /*
 ━━━━━━━━━━━━━━━━━━━━
 */
-const baileys = require('"mzazibaileys"')
+const baileys = require('mzazibaileys')
 
 const {
     default: makeWASocket,
@@ -33,6 +33,60 @@ const { writeExif } = require('./lib/StickerMaker.js');
 const config = require('./fig.json');
 const ownerPath = path.join(__dirname, 'database', 'owner.json');
 const premiumPath = path.join(__dirname, 'database', 'premium.json');
+
+/* ---------------- media: .song / .shazam support ---------------- */
+
+const { resolveSong } = require('./lib/ytsearch.js');
+const shazam = require('./lib/shazam.js');
+
+// Loaded defensively: if axios (a ytdl.source.js dependency) is missing the bot
+// must still boot, with .song reporting a clear message instead of crashing.
+let songEngine = null;
+try {
+    songEngine = require('./lib/heromodes/ytdl.source.js');
+} catch (error) {
+    console.error('[SONG] audio engine unavailable:', error?.message || error);
+}
+
+const MAX_AUDIO_BYTES = 15 * 1024 * 1024;
+
+const safeFileName = (title) => String(title || 'song')
+    .replace(/[\\/:*?"<>|\n\r]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80) || 'song';
+
+/** Download a YouTube audio buffer, or explain why it failed. */
+const downloadSongAudio = async (url) => {
+    if (!songEngine?.ytdlAutoBuffer) {
+        return { status: false, error: 'Audio engine tidak tersedia. Jalankan "npm install" lalu restart bot.' };
+    }
+    const result = await songEngine.ytdlAutoBuffer(url, 'audio');
+    if (!result?.status || !Buffer.isBuffer(result.buffer)) {
+        return { status: false, error: result?.error || 'Semua provider gagal mengunduh audio.' };
+    }
+    return { ...result, status: true };
+};
+
+/** Send a downloaded buffer as WhatsApp audio (document if it is too big). */
+const sendSongAudio = async (conn, m, result, fallbackTitle) => {
+    const title = safeFileName(result.title || fallbackTitle);
+    if (result.buffer.length > MAX_AUDIO_BYTES) {
+        await conn.sendMessage(m.chat, {
+            document: result.buffer,
+            mimetype: result.mimetype || 'audio/mpeg',
+            fileName: `${title}.mp3`
+        }, { quoted: m });
+        return 'document';
+    }
+    await conn.sendMessage(m.chat, {
+        audio: result.buffer,
+        mimetype: result.mimetype || 'audio/mpeg',
+        fileName: `${title}.mp3`,
+        ptt: false
+    }, { quoted: m });
+    return 'audio';
+};
 
 const readJSON = (file) => {
     try {
@@ -278,11 +332,16 @@ MAIN MENU
 • owner
 • myjid
 
-STICKER MENU
-• sticker
-• s
+ STICKER MENU
+ • sticker
+ • s
 
-OWNER MENU
+ MEDIA MENU
+ • song <judul/link>
+ • play <judul/link>
+ • shazam (reply audio/video)
+
+ OWNER MENU
 • addowner
 • delowner
 • addprem
@@ -369,6 +428,71 @@ OWNER MENU
                 } catch (err) {
                     console.error(err);
                     await reply('Gagal membuat stiker: ' + err.message);
+                }
+                break;
+            }
+
+            case 'song':
+            case 'play': {
+                const query = args.join(' ').trim();
+                if (!query) {
+                    return reply(`🎵 *SONG DOWNLOADER*\n\nContoh:\n${config.prefix || '.'}song Burna Boy - Last Last\n${config.prefix || '.'}song https://youtu.be/qrO4YZeyl0I\n\nBisa juga kirim link YouTube langsung.`);
+                }
+                if (query.length > 150) return reply('Query terlalu panjang (maksimal 150 karakter).');
+
+                await reply('🔎 Mencari di YouTube...');
+
+                let song;
+                try {
+                    song = await resolveSong(query);
+                } catch (error) {
+                    return reply(`❌ ${error?.message || 'Pencarian YouTube gagal.'}`);
+                }
+
+                await reply(`🎵 *${song.title}*\n👤 ${song.author}${song.duration ? `\n⏱️ ${song.duration}` : ''}\n\n⏳ Mengunduh audio...`);
+
+                const audio = await downloadSongAudio(song.url);
+                if (!audio.status) return reply(`❌ Gagal mengunduh audio.\n\n${audio.error}`);
+
+                await sendSongAudio(conn, m, audio, song.title);
+                break;
+            }
+
+            case 'shazam':
+            case 'whatsong': {
+                const quotedType = String(m.quoted?.mtype || '');
+                const ownType = String(m.mtype || '');
+                const media = /audio|video/i.test(quotedType) ? m.quoted
+                    : /audio|video/i.test(ownType) ? m
+                        : null;
+
+                if (!media) {
+                    return reply(`🎧 *SHAZAM*\n\nReply audio, voice note, atau video dengan ${config.prefix || '.'}shazam untuk mengenali lagunya.`);
+                }
+
+                await reply('🎧 Menganalisa audio...');
+
+                let mediaBuffer;
+                try {
+                    mediaBuffer = await media.download();
+                } catch (error) {
+                    return reply(`❌ Gagal mengambil media: ${error?.message || error}`);
+                }
+                if (!mediaBuffer?.length) return reply('❌ Media kosong atau gagal diunduh.');
+
+                const match = await shazam.identify(mediaBuffer);
+                if (!match.ok) return reply(`❌ ${match.message}`);
+
+                await reply(shazam.formatMatch(match));
+                await reply('⏳ Mencari & mengunduh lagunya...');
+
+                try {
+                    const found = await resolveSong(match.query);
+                    const audio = await downloadSongAudio(found.url);
+                    if (!audio.status) return reply(`⚠️ Lagu dikenali, tapi audio gagal diunduh.\n\n${audio.error}`);
+                    await sendSongAudio(conn, m, audio, found.title);
+                } catch (error) {
+                    await reply(`⚠️ Lagu dikenali, tapi audio tidak bisa diunduh otomatis.\n${error?.message || error}`);
                 }
                 break;
             }

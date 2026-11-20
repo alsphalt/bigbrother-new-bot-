@@ -1,5 +1,10 @@
 node_modules/
 auth/
 session/
+tmp/
 *.log
 .DS_Store
+
+# credentials / cookies - never commit
+.env
+cookies.json

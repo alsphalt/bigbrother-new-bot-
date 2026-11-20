@@ -8,14 +8,16 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "mzazibaileys": "^2.2.2",
+    "@distube/ytdl-core": "^4.16.4",
     "@hapi/boom": "^10.0.1",
-    "sharp": "^0.34.0",
-    "pino": "^8.17.2",
+    "axios": "^1.21.1",
     "chalk": "^4.1.2",
+    "ffmpeg-static": "^5.2.0",
     "file-type": "^21.0.0",
     "fluent-ffmpeg": "^2.1.2",
-    "ffmpeg-static": "^5.2.0",
-    "node-webpmux": "^3.1.0"
+    "mzazibaileys": "^2.2.2",
+    "node-webpmux": "^3.1.0",
+    "pino": "^8.17.2",
+    "sharp": "^0.34.0"
   }
 }
