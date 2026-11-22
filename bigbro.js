@@ -152,6 +152,98 @@ const isPremium = (m) => {
     return isOwner(m) || premiumDB.includes(sender);
 };
 
+// ─────────────────────────────────────────────────────────────────────
+// ANTICALL — helpers
+// ─────────────────────────────────────────────────────────────────────
+const anticallPath = path.join(__dirname, 'database', 'anticall.json');
+
+const ANTICALL_DEFAULTS = {
+    enabled: false,
+    action: 'reject',
+    warn: true,
+    warnText: '📵 Calls are not accepted on this bot. Please send a text message instead.',
+    autoBlock: false,
+    whitelist: [],
+    blocked: []
+};
+
+const normPhone = (jid = '') =>
+    String(jid).split('@')[0].split(':')[0].replace(/\D/g, '');
+
+const loadAnticall = () => {
+    // readJSONObject() keeps {} so spread order and array fields stay sane;
+    // readJSON() would seed [] and silently swallow the stored settings.
+    const stored = readJSONObject(anticallPath);
+    return {
+        ...ANTICALL_DEFAULTS,
+        ...stored,
+        whitelist: Array.isArray(stored.whitelist) ? stored.whitelist.map(normPhone) : [],
+        blocked: Array.isArray(stored.blocked) ? stored.blocked.map(normPhone) : []
+    };
+};
+
+const saveAnticall = (cfg) => saveJSON(anticallPath, cfg);
+
+const isWhitelisted = (cfg, callerJid) =>
+    Array.isArray(cfg.whitelist) && cfg.whitelist.includes(normPhone(callerJid));
+
+/**
+ * Handle an incoming call.
+ * @param {object} conn Baileys socket
+ * @param {object} call { id, from, status, isVideo }
+ * @returns {Promise<{action: 'ignored'|'rejected'|'blocked'|'error', reason?: string}>}
+ */
+const handleIncomingCall = async (conn, call) => {
+    const cfg = loadAnticall();
+
+    // 1. Master switch
+    if (!cfg.enabled) return { action: 'ignored', reason: 'disabled' };
+
+    // 2. Only react to offers (not timeouts, terminates, etc.)
+    if (call?.status !== 'offer') return { action: 'ignored', reason: 'not-offer' };
+
+    // 3. Whitelist bypass
+    if (isWhitelisted(cfg, call.from)) {
+        return { action: 'ignored', reason: 'whitelisted' };
+    }
+
+    // 4. Reject the call
+    try {
+        await conn.rejectCall(call.id, call.from);
+    } catch (e) {
+        console.error('[anticall] rejectCall failed:', e?.message || e);
+        return { action: 'error', reason: 'reject-failed' };
+    }
+
+    // 5. Optional warning message
+    if (cfg.warn && cfg.warnText) {
+        try {
+            await conn.sendMessage(call.from, { text: cfg.warnText });
+        } catch (e) {
+            console.error('[anticall] warn send failed:', e?.message || e);
+        }
+    }
+
+    // 6. Optional auto-block
+    const shouldBlock = cfg.autoBlock || cfg.action === 'block';
+    if (shouldBlock) {
+        try {
+            await conn.updateBlockStatus(call.from, 'block');
+            // Track blocked callers for `.anticall unblock <n>`
+            if (!cfg.blocked.includes(normPhone(call.from))) {
+                cfg.blocked.push(normPhone(call.from));
+                saveAnticall(cfg);
+            }
+            return { action: 'blocked' };
+        } catch (e) {
+            console.error('[anticall] block failed:', e?.message || e);
+            return { action: 'rejected', reason: 'block-failed' };
+        }
+    }
+
+    return { action: 'rejected' };
+};
+
 // System executeEval
 const executeEval = async (code, conn, m) => {
     try {
@@ -308,6 +400,7 @@ module.exports = async (conn, m) => {
 • ${config.prefix || '.'}antidemote on/off
 
 *OWNER*
+• ${config.prefix || '.'}anticall on/off
 • ${config.prefix || '.'}addowner
 • ${config.prefix || '.'}delowner
 • ${config.prefix || '.'}addprem
@@ -685,7 +778,126 @@ module.exports = async (conn, m) => {
     );
 }
 
-           case 'public': {
+            // ── ANTICALL ────────────────────────────────────────────────────────
+            case 'anticall': {
+                if (!isOwner(m) && !isCreator(m)) {
+                    return m.reply('Owner only.');
+                }
+
+                const prefix = config.prefix || '.';
+                const cfg = loadAnticall();
+                const sub = (args[0] || '').toLowerCase();
+                const rest = args.slice(1);
+
+                // no args → show status
+                if (!sub) {
+                    return m.reply(
+                        `*ANTICALL*\n\n` +
+                        `Status : ${cfg.enabled ? 'ON' : 'OFF'}\n` +
+                        `Action : ${cfg.autoBlock || cfg.action === 'block' ? 'block' : 'reject'}\n` +
+                        `Warn caller: ${cfg.warn ? 'yes' : 'no'}\n` +
+                        `Whitelist : ${cfg.whitelist.length ? cfg.whitelist.join(', ') : '-'}\n` +
+                        `Blocked : ${cfg.blocked.length ? cfg.blocked.join(', ') : '-'}\n\n` +
+                        `Commands:\n` +
+                        `• ${prefix}anticall on\n` +
+                        `• ${prefix}anticall off\n` +
+                        `• ${prefix}anticall reject\n` +
+                        `• ${prefix}anticall block\n` +
+                        `• ${prefix}anticall warn on|off\n` +
+                        `• ${prefix}anticall text <message>\n` +
+                        `• ${prefix}anticall whitelist add|del <number>\n` +
+                        `• ${prefix}anticall unblock <number|all>`
+                    );
+                }
+
+                // on / off
+                if (sub === 'on' || sub === 'off') {
+                    cfg.enabled = sub === 'on';
+                    saveAnticall(cfg);
+                    return m.reply(`✅ Anticall is now *${sub.toUpperCase()}*`);
+                }
+
+                // reject / block
+                if (sub === 'reject' || sub === 'block') {
+                    cfg.action = sub;
+                    cfg.autoBlock = sub === 'block';
+                    saveAnticall(cfg);
+                    return m.reply(`✅ Anticall action → *${sub}*`);
+                }
+
+                // warn on|off
+                if (sub === 'warn') {
+                    const v = (rest[0] || '').toLowerCase();
+                    if (!['on', 'off'].includes(v)) return m.reply(`Usage: ${prefix}anticall warn on|off`);
+                    cfg.warn = v === 'on';
+                    saveAnticall(cfg);
+                    return m.reply(`✅ Warn caller → *${v}*`);
+                }
+
+                // text <message>
+                if (sub === 'text') {
+                    const text = rest.join(' ').trim();
+                    if (!text) return m.reply(`Usage: ${prefix}anticall text <message>`);
+                    cfg.warnText = text;
+                    cfg.warn = true;
+                    saveAnticall(cfg);
+                    return m.reply(`✅ Warning text updated.`);
+                }
+
+                // whitelist add|del <number>
+                if (sub === 'whitelist') {
+                    const op = (rest[0] || '').toLowerCase();
+                    const num = (rest[1] || '').replace(/\D/g, '');
+                    if (!['add', 'del', 'remove'].includes(op) || !num) {
+                        return m.reply(`Usage: ${prefix}anticall whitelist add|del <number>`);
+                    }
+                    if (op === 'add') {
+                        if (cfg.whitelist.includes(num)) return m.reply('Already whitelisted.');
+                        cfg.whitelist.push(num);
+                        saveAnticall(cfg);
+                        return m.reply(`✅ Added *${num}* to whitelist.`);
+                    } else {
+                        cfg.whitelist = cfg.whitelist.filter(x => x !== num);
+                        saveAnticall(cfg);
+                        return m.reply(`✅ Removed *${num}* from whitelist.`);
+                    }
+                }
+
+                // unblock <number|all>
+                if (sub === 'unblock') {
+                    const target = (rest[0] || '').toLowerCase();
+                    if (!target) return m.reply(`Usage: ${prefix}anticall unblock <number|all>`);
+
+                    if (target === 'all') {
+                        const list = [...cfg.blocked];
+                        for (const n of list) {
+                            try {
+                                await conn.updateBlockStatus(n + '@s.whatsapp.net', 'unblock');
+                            } catch (e) {
+                                console.error('[anticall] unblock', n, e?.message || e);
+                            }
+                        }
+                        cfg.blocked = [];
+                        saveAnticall(cfg);
+                        return m.reply(`✅ Unblocked ${list.length} number(s).`);
+                    }
+
+                    const num = target.replace(/\D/g, '');
+                    if (!num) return m.reply('Invalid number.');
+                    try {
+                        await conn.updateBlockStatus(num + '@s.whatsapp.net', 'unblock');
+                    } catch (e) {
+                        return m.reply(`❌ Failed to unblock: ${e.message}`);
+                    }
+                    cfg.blocked = cfg.blocked.filter(x => x !== num);
+                    saveAnticall(cfg);
+                    return m.reply(`✅ Unblocked *${num}*.`);
+                }
+
+                return m.reply(`Unknown subcommand. Send *${prefix}anticall* for the menu.`);
+            }
+
+            case 'public': {
     if (!isOwner(m)) return reply('Owner only')
 
     config.mode = 'public'
@@ -713,3 +925,7 @@ module.exports = async (conn, m) => {
         console.error('Error in command handler:', err);
     }
 };
+
+// Incoming-call handler, bound from index.js on the live socket.
+module.exports.handleIncomingCall = handleIncomingCall;
+module.exports.loadAnticall = loadAnticall;

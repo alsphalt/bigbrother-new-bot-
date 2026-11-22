@@ -1,0 +1,9 @@
+{
+  "enabled": false,
+  "action": "reject",
+  "warn": true,
+  "warnText": "📵 Calls are not accepted on this bot. Please send a text message instead.",
+  "autoBlock": false,
+  "whitelist": [],
+  "blocked": []
+}

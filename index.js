@@ -313,6 +313,29 @@ async function connectToWhatsApp() {
         }
     })
 
+    /*
+     * ANTICALL — incoming call offers.
+     *
+     * Baileys emits `call` with an array of call events. The handler lives in
+     * bigbro.js and re-reads database/anticall.json on every event, so
+     * `.anticall off` takes effect immediately without a restart.
+     */
+    conn.ev.on('call', async (calls) => {
+        const list = Array.isArray(calls) ? calls : [calls]
+        for (const call of list) {
+            try {
+                const handler = handleMessage.handleIncomingCall
+                if (typeof handler !== 'function') continue
+                const result = await handler(conn, call)
+                if (result?.action && result.action !== 'ignored') {
+                    console.log('[anticall]', result.action, call?.from || '', result.reason || '')
+                }
+            } catch (error) {
+                console.error('[anticall] handler failed:', error?.stack || error)
+            }
+        }
+    })
+
     conn.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update
 
