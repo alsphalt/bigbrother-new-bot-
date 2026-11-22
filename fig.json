@@ -1,9 +1,12 @@
 {
   "ownerNumber": "",
   "ownerJid": "",
-  "botName": "£=DARKNOTE",
+  "botName": "\u00a3=DARKNOTE",
   "mode": "public",
   "prefix": ".",
   "creator": "bigbrother",
-  "creatornum": "254705472771"
+  "creatornum": "254705472771",
+  "menu": {
+    "mode": "legacy"
+  }
 }

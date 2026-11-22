@@ -322,6 +322,73 @@ module.exports = async (conn, m) => {
             await conn.sendMessage(m.chat, { image: thumb, caption }, { quoted: m })
         }
 
+        /*
+         * MENU DELIVERY — legacy buttonsMessage by default.
+         *
+         * A plain image + caption carries no buttons, so the menu looked like a
+         * dead end. The legacy buttonsMessage (location header + type-1 buttons)
+         * is what most clients actually render; the newer interactive card is
+         * kept as an opt-in for clients that handle it better.
+         *
+         *     fig.json -> menu.mode = "legacy" | "interactive"   (default "legacy")
+         *
+         * If the button message cannot be relayed, the image card and then plain
+         * text are used, so `.menu` always produces something visible.
+         */
+        const MENU_BUTTONS = [
+            { id: 'allmenu', text: '📋 ALL MENU' },
+            { id: 'ping', text: '⚡ PING' },
+            { id: 'owner', text: '👑 OWNER' }
+        ]
+
+        const menuMode = () => String(config.menu?.mode || 'legacy').toLowerCase() === 'interactive'
+            ? 'interactive'
+            : 'legacy'
+
+        const sendLegacyMenu = async (text) => {
+            const content = {
+                buttonsMessage: {
+                    locationMessage: {
+                        degreesLatitude: 0,
+                        degreesLongitude: 0,
+                        name: 'DARKNOTE',
+                        address: 'bigbrother Base Bot',
+                        jpegThumbnail: thumb
+                    },
+                    contentText: text,
+                    footerText: 'DARKNOTE • bigbrothercode',
+                    buttons: MENU_BUTTONS.map(button => ({
+                        buttonId: button.id,
+                        buttonText: { displayText: button.text },
+                        type: 1
+                    })),
+                    headerType: 6
+                }
+            }
+            const msg = generateWAMessageFromContent(m.chat, content, {
+                quoted: m,
+                userJid: conn.user?.id
+            })
+            await conn.relayMessage(m.chat, msg.message, { messageId: msg.key.id })
+        }
+
+        const sendMenu = async (text) => {
+            if (menuMode() === 'legacy') {
+                try {
+                    await sendLegacyMenu(text)
+                    return
+                } catch (error) {
+                    console.log('[MENU] legacy button message failed, falling back:', error?.message || error)
+                }
+            }
+            try {
+                await sendImageCard(text)
+            } catch (error) {
+                console.log('[MENU] image card failed, sending text instead:', error?.message || error)
+                await reply(text)
+            }
+        }
+
        // Self
        if (config.mode === 'self' && !isCreator(m)) return
        //Case
@@ -351,23 +418,12 @@ module.exports = async (conn, m) => {
 ┗━━━━━━━━━━━━━━⬣`
 
     const body = `${infoText}\n\n${allMenuText()}`
-    try {
-        await sendImageCard(body)
-    } catch (error) {
-        console.log('[MENU] image card failed, sending text instead:', error?.message || error)
-        await reply(body)
-    }
+    await sendMenu(body)
     break
 }
 
         case 'allmenu': {
-            const body = allMenuText()
-            try {
-                await sendImageCard(body)
-            } catch (error) {
-                console.log('[MENU] image card failed, sending text instead:', error?.message || error)
-                await reply(body)
-            }
+            await sendMenu(allMenuText())
             break
         }
 
@@ -555,7 +611,43 @@ module.exports = async (conn, m) => {
                 break;
             }
             
-           case 'antipromote':
+           case 'antipromote': {
+    if (!m.isGroup) return m.reply('Only for groups.');
+
+    const meta = await conn.groupMetadata(m.chat);
+    const senderIsAdmin = isGroupAdminOf(meta?.participants, m.sender);
+
+    if (!senderIsAdmin && !isOwner(m) && !isCreator(m))
+        return m.reply('Group admin / owner only.');
+
+    const file = path.join(__dirname, 'database', 'antiactions.json');
+    const snapFile = path.join(__dirname, 'database', 'adminSnapshot.json');
+
+    const db = readJSONObject(file);
+    const snap = readJSONObject(snapFile);
+    db[m.chat] = db[m.chat] && typeof db[m.chat] === 'object' ? db[m.chat] : {};
+
+    const arg = (args[0] || '').toLowerCase();
+
+    if (arg === 'on' || arg === 'off') {
+        db[m.chat].antipromote = arg === 'on';
+        // Seed the snapshot with the CURRENT admins so existing admins are not
+        // mass-demoted on the first event after enabling.
+        snap[m.chat] = (meta?.participants || [])
+            .filter(p => p.admin === 'admin' || p.admin === 'superadmin')
+            .map(p => p.id);
+        saveJSON(file, db);
+        saveJSON(snapFile, snap);
+        return m.reply(`✅ *antipromote* → *${arg.toUpperCase()}*`);
+    }
+
+    return m.reply(
+        `*antipromote*: ${db[m.chat].antipromote ? 'ON' : 'OFF'}\n\n` +
+        `• ${config.prefix || '.'}antipromote on\n` +
+        `• ${config.prefix || '.'}antipromote off`
+    );
+}
+
            case 'antidemote': {
     if (!m.isGroup) return m.reply('This command only works in groups.');
 
@@ -569,7 +661,7 @@ module.exports = async (conn, m) => {
     const gid = m.chat;
     db[gid] = db[gid] && typeof db[gid] === 'object' ? db[gid] : {};
 
-    const key = command; // 'antipromote' | 'antidemote'
+    const key = command; // 'antidemote'
     const arg = (args[0] || '').toLowerCase();
 
     if (arg === 'on' || arg === 'off') {

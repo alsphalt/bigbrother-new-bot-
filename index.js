@@ -19,6 +19,22 @@ const rl = readline.createInterface({
 
 const question = (text) => new Promise((resolve) => rl.question(text, resolve))
 
+/* Keyed JSON stores (antiactions / adminSnapshot). readJSON() in bigbro.js
+ * seeds [] which would drop the group keys on the next stringify. */
+const readJSONObject = (file) => {
+    try {
+        if (!fs.existsSync(file)) fs.writeFileSync(file, '{}')
+        const value = JSON.parse(fs.readFileSync(file, 'utf8'))
+        return value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+    } catch {
+        return {}
+    }
+}
+
+const saveJSONObject = (file, data) => {
+    fs.writeFileSync(file, JSON.stringify(data, null, 2))
+}
+
 let reconnectTimeout = null
 let isReconnecting = false
 let pairCodeRequested = false
@@ -144,26 +160,25 @@ async function connectToWhatsApp() {
     })
 
     /*
-     * Anti-promote / anti-demote enforcement.
+     * Anti-demote enforcement.
      *
      * Registered here (not in bigbro.js) because the listener needs the live socket, while
-     * bigbro.js only ever receives (conn, m) per message. The toggles themselves are stored
-     * per group in database/antiactions.json and set via .antipromote / .antidemote.
+     * bigbro.js only ever receives (conn, m) per message. The toggle is stored per group
+     * in database/antiactions.json and set via .antidemote. Anti-promote has its own
+     * snapshot-based listener below.
      */
     conn.ev.on('group-participants.update', async (update) => {
         try {
             const { id, participants, action, author } = update
-            if (!['promote', 'demote'].includes(action)) return
+            if (action !== 'demote') return
 
             const file = path.join(__dirname, 'database', 'antiactions.json')
-            let db = {}
-            try { db = JSON.parse(fs.readFileSync(file)) || {} } catch {}
-            if (Array.isArray(db)) db = {}
+            const db = readJSONObject(file)
 
             const cfg = db[id]
             if (!cfg) return
 
-            const key = action === 'promote' ? 'antipromote' : 'antidemote'
+            const key = 'antidemote'
             if (!cfg[key]) return
 
             // Skip actions by the bot itself (would loop) and by the configured owner.
@@ -176,11 +191,7 @@ async function connectToWhatsApp() {
             const reverted = []
             for (const jid of participants || []) {
                 try {
-                    if (action === 'promote') {
-                        await conn.groupParticipantsUpdate(id, [jid], 'demote')
-                    } else {
-                        await conn.groupParticipantsUpdate(id, [jid], 'promote')
-                    }
+                    await conn.groupParticipantsUpdate(id, [jid], 'promote')
                     reverted.push(jid)
                 } catch (error) {
                     console.error('[antiaction] revert failed for', jid, error?.message || error)
@@ -195,6 +206,110 @@ async function connectToWhatsApp() {
             })
         } catch (error) {
             console.error('[antiaction]', error)
+        }
+    })
+
+    /*
+     * ANTI-PROMOTE — snapshot based.
+     *
+     * WhatsApp gives no reliable "who promoted whom" for a rogue promotion, so the
+     * only trustworthy signal is the admin list itself: keep a per-group snapshot
+     * (database/adminSnapshot.json) and treat any JID that became admin without
+     * being in that snapshot as a rogue promotion. The promoter (event author) and
+     * the promoted user are both demoted, unless the promoter is the creator or the
+     * bot itself. The snapshot is seeded when the feature is switched on and kept
+     * fresh on every participant event, so enabling the feature never mass-demotes
+     * the admins that were already there.
+     */
+    conn.ev.on('group-participants.update', async (update) => {
+        try {
+            const { id, participants, action, author } = update
+            if (!['promote', 'demote', 'add', 'remove'].includes(action)) return
+
+            const file = path.join(__dirname, 'database', 'antiactions.json')
+            const snapFile = path.join(__dirname, 'database', 'adminSnapshot.json')
+            const db = readJSONObject(file)
+            const snap = readJSONObject(snapFile)
+
+            const adminsOf = (meta) => (meta?.participants || [])
+                .filter(p => p.admin === 'admin' || p.admin === 'superadmin')
+                .map(p => p.id)
+
+            if (!db[id]?.antipromote) {
+                // Keep the snapshot fresh even when the feature is off.
+                try {
+                    const meta = await conn.groupMetadata(id)
+                    snap[id] = adminsOf(meta)
+                    saveJSONObject(snapFile, snap)
+                } catch { }
+                return
+            }
+
+            // ── resolve protected identities ────────────────────────────────
+            const norm = (j) => String(j || '').split('@')[0].split(':')[0].replace(/\D/g, '')
+            const creatorNum = String(config.ownerNumber || '').replace(/\D/g, '')
+            const botNum = norm(conn.user?.id)
+            const authorNum = norm(author)
+
+            const isProtected = (jid) => {
+                const n = norm(jid)
+                if (!n) return false // missing author must not read as "protected"
+                return (!!creatorNum && n === creatorNum) || (!!botNum && n === botNum)
+            }
+
+            // ── fetch current admins & diff against the snapshot ────────────
+            const meta = await conn.groupMetadata(id)
+            const currentAdmins = adminsOf(meta)
+            const previousAdmins = Array.isArray(snap[id]) ? snap[id] : []
+
+            const newAdmins = currentAdmins.filter(j => !previousAdmins.includes(j))
+
+            // Update the snapshot regardless of what happens next.
+            snap[id] = currentAdmins
+            saveJSONObject(snapFile, snap)
+
+            if (!newAdmins.length) return // nothing newly promoted
+
+            // ── decide who to demote ───────────────────────────────────────
+            const targets = []
+
+            for (const newAdmin of newAdmins) {
+                if (isProtected(newAdmin)) continue // creator / bot promoted → allowed
+                if (isProtected(author)) continue   // promoter is creator or bot → allow
+                // real rogue promote → demote BOTH promoter and promoted
+                targets.push(newAdmin)
+                if (author && !isProtected(author)) targets.push(author)
+            }
+
+            const uniqueTargets = [...new Set(targets)]
+            if (!uniqueTargets.length) return
+
+            // ── FAST ACTION: single batched demote call ─────────────────────
+            try {
+                await conn.groupParticipantsUpdate(id, uniqueTargets, 'demote')
+            } catch (error) {
+                console.error('[antipromote] batch demote failed:', error?.message || error)
+                // Fallback: one by one so one bad JID does not block the rest.
+                for (const target of uniqueTargets) {
+                    try {
+                        await conn.groupParticipantsUpdate(id, [target], 'demote')
+                    } catch (err) {
+                        console.error('[antipromote]', target, err?.message || err)
+                    }
+                }
+            }
+
+            // ── notify ─────────────────────────────────────────────────────
+            await conn.sendMessage(id, {
+                text:
+                    `🛡️ *ANTI-PROMOTE TRIGGERED*\n\n` +
+                    `Promoted by : @${authorNum || 'unknown'}\n` +
+                    `New admin   : ${newAdmins.map(j => '@' + norm(j)).join(', ')}\n` +
+                    `Action      : demoted ${uniqueTargets.length} user(s)`,
+                mentions: [...uniqueTargets, ...newAdmins, author].filter(Boolean)
+            }).catch(() => { })
+        } catch (error) {
+            console.error('[antipromote]', error)
         }
     })
 
