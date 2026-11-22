@@ -8,3 +8,10 @@ tmp/
 # credentials / cookies - never commit
 .env
 cookies.json
+.cookies.ytdlp.txt
+cookies.txt
+*.bak
+*.bak-*
+*-base.js
+database/owner.json
+database/premium.json

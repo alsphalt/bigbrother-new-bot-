@@ -59,7 +59,7 @@ const safeFileName = (title) => String(title || 'song')
 /** Download a YouTube audio buffer, or explain why it failed. */
 const downloadSongAudio = async (url) => {
     if (!songEngine?.ytdlAutoBuffer) {
-        return { status: false, error: 'Audio engine tidak tersedia. Jalankan "npm install" lalu restart bot.' };
+        return { status: false, error: 'Audio engine is unavailable. Run "npm install" then restart the bot.' };
     }
     const result = await songEngine.ytdlAutoBuffer(url, 'audio');
     if (!result?.status || !Buffer.isBuffer(result.buffer)) {
@@ -71,18 +71,27 @@ const downloadSongAudio = async (url) => {
 /** Send a downloaded buffer as WhatsApp audio (document if it is too big). */
 const sendSongAudio = async (conn, m, result, fallbackTitle) => {
     const title = safeFileName(result.title || fallbackTitle);
+    // yt-dlp returns m4a (audio/mp4); ytdl-core returned mp4/webm too. Labelling a
+    // non-mp3 buffer as ".mp3" made WhatsApp show it as an unknown document.
+    const mimetype = result.mimetype || 'audio/mpeg';
+    const ext = /mp4|m4a/.test(mimetype) ? 'm4a'
+        : /ogg|opus/.test(mimetype) ? 'ogg'
+        : /webm/.test(mimetype) ? 'webm'
+        : /wav/.test(mimetype) ? 'wav'
+        : 'mp3';
+    const fileName = `${title}.${ext}`;
     if (result.buffer.length > MAX_AUDIO_BYTES) {
         await conn.sendMessage(m.chat, {
             document: result.buffer,
-            mimetype: result.mimetype || 'audio/mpeg',
-            fileName: `${title}.mp3`
+            mimetype,
+            fileName
         }, { quoted: m });
         return 'document';
     }
     await conn.sendMessage(m.chat, {
         audio: result.buffer,
-        mimetype: result.mimetype || 'audio/mpeg',
-        fileName: `${title}.mp3`,
+        mimetype,
+        fileName,
         ptt: false
     }, { quoted: m });
     return 'audio';
@@ -99,6 +108,27 @@ const readJSON = (file) => {
 
 const saveJSON = (file, data) => {
     fs.writeFileSync(file, JSON.stringify(data, null, 2));
+};
+
+// readJSON() seeds a missing file with [], which would silently break the keyed
+// antiactions store (an array drops string keys on stringify). This variant keeps {}.
+const readJSONObject = (file) => {
+    try {
+        if (!fs.existsSync(file)) fs.writeFileSync(file, '{}');
+        const value = JSON.parse(fs.readFileSync(file));
+        return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    } catch {
+        return {};
+    }
+};
+
+const isGroupAdminOf = (participants, jid) => {
+    const me = getNumber(jid);
+    if (!me) return false;
+    const row = (participants || []).find(p =>
+        getNumber(p.id || p.jid || p.lid) === me
+    );
+    return !!row && (row.admin === 'admin' || row.admin === 'superadmin');
 };
 
 const getNumber = (jid = '') => String(jid).split('@')[0].replace(/\D/g, '');
@@ -215,19 +245,19 @@ module.exports = async (conn, m) => {
         } else {
             const trimmed = body.trim();
             if (trimmed.startsWith(']>')) {
-                if (!isCreator(m)) return m.reply('Perintah eval hanya untuk creator.');
+                if (!isCreator(m)) return m.reply('Eval is creator-only.');
                 const evalCode = trimmed.slice(2).trim();
-                if (!evalCode) return m.reply('Contoh:\n]> 1+1');
+                if (!evalCode) return m.reply('Example:\n]> 1+1');
                 return await executeEval(evalCode, conn, m);
             }
             if (trimmed.startsWith('$')) {
-                if (!isCreator(m)) return m.reply('❌ Perintah shell hanya untuk creator.');
+                if (!isCreator(m)) return m.reply('❌ Shell is creator-only.');
                 const shellCmd = trimmed.slice(1).trim();
-                if (!shellCmd) return m.reply('Contoh: $ ls -la');
-                m.reply('⏳ Menjalankan perintah shell...');
+                if (!shellCmd) return m.reply('Example: $ ls -la');
+                m.reply('⏳ Running shell command...');
                 exec(shellCmd, { timeout: 30000, maxBuffer: 5 * 1024 * 1024 }, (error, stdout, stderr) => {
-                    let output = stdout || stderr || error?.message || '✅ Selesai (tidak ada output)';
-                    if (output.length > 2000) output = output.slice(0, 2000) + '\n... (output dipotong)';
+                    let output = stdout || stderr || error?.message || '✅ Done (no output)';
+                    if (output.length > 2000) output = output.slice(0, 2000) + '\n... (output truncated)';
                     m.reply(`💻 Output:\n${output}`);
                 });
                 return;
@@ -244,10 +274,53 @@ module.exports = async (conn, m) => {
 
         const { reply } = m;
 
-        const thumb = await sharp('./src/img/menu.jpg')
-        .resize(300, 300)
-        .jpeg({ quality: 80 })
-        .toBuffer()
+        // Guarded: a missing/corrupt menu.jpg must not take down every command.
+        let thumb
+        try {
+            thumb = await sharp('./src/img/menu.jpg')
+                .resize(300, 300)
+                .jpeg({ quality: 80 })
+                .toBuffer()
+        } catch (error) {
+            console.log('[MENU] thumbnail unavailable:', error?.message || error)
+        }
+
+        const allMenuText = () => `*ALL MENU*
+
+*MAIN*
+• ${config.prefix || '.'}menu
+• ${config.prefix || '.'}ping
+• ${config.prefix || '.'}info
+• ${config.prefix || '.'}owner
+• ${config.prefix || '.'}myjid
+
+*STICKER*
+• ${config.prefix || '.'}sticker
+• ${config.prefix || '.'}s
+
+*MEDIA*
+• ${config.prefix || '.'}song <title/link>
+• ${config.prefix || '.'}play <title/link>
+• ${config.prefix || '.'}shazam (reply to audio/video)
+
+*GROUP*
+• ${config.prefix || '.'}antipromote on/off
+• ${config.prefix || '.'}antidemote on/off
+
+*OWNER*
+• ${config.prefix || '.'}addowner
+• ${config.prefix || '.'}delowner
+• ${config.prefix || '.'}addprem
+• ${config.prefix || '.'}delprem
+• ${config.prefix || '.'}eval`
+
+        // Location-header button card. WhatsApp renders the thumbnail as the header and
+        // the buttons under it; the caller falls back to plain text if the payload is
+        // rejected so the menu is never silent.
+        const sendImageCard = async (caption) => {
+            if (!thumb) throw new Error('menu image unavailable')
+            await conn.sendMessage(m.chat, { image: thumb, caption }, { quoted: m })
+        }
 
        // Self
        if (config.mode === 'self' && !isCreator(m)) return
@@ -265,169 +338,92 @@ module.exports = async (conn, m) => {
     const ping = Date.now() - (Number(m.messageTimestamp) * 1000)
     const mode = config.mode === 'self' ? 'SELF' : 'PUBLIC'
 
-    await conn.relayMessage(
-        m.chat,
-        {
-            buttonsMessage: {
-                locationMessage: {
-                    degreesLatitude: 0,
-                    degreesLongitude: 0,
-                    name: 'bigbrothercode',
-                    address: 'bigbrothercode',
-                    jpegThumbnail: thumb
-                },
-contentText: `
-┏━━━〔 INFO BOT 〕━━━⬣
+    const infoText = `┏━━━〔 BOT INFO 〕━━━⬣
 ┃
-┃❍ Nama Bot : bigbrother Base Bot
+┃❍ Bot Name : bigbrother Base Bot
 ┃❍ Developer : bigbrothercode
 ┃❍ Type : Case
 ┃❍ Mode : ${mode}
 ┃❍ Number : ${String(m.sender).replace(/@.+/g, '')}
 ┃❍ Ping : ${Math.floor(ping)} ms
-┃❍ Runtime : ${days}H ${hours}J ${minutes}M ${seconds}D
+┃❍ Runtime : ${days}d ${hours}h ${minutes}m ${seconds}s
 ┃
-┗━━━━━━━━━━━━━━⬣
+┗━━━━━━━━━━━━━━⬣`
 
-Klik tombol di bawah untuk melihat semua menu.`,
-                footerText: 'bigbrother Bot',
-                buttons: [
-                    {
-                        buttonId: 'allmenu',
-                        buttonText: {
-                            displayText: 'All Menu'
-                        },
-                        type: 1
-                    }
-                ],
-                headerType: 6
-            }
-        },
-        {
-            quoted: m,
-            messageId: conn.generateMessageTag()
-        }
-    )
+    const body = `${infoText}\n\n${allMenuText()}`
+    try {
+        await sendImageCard(body)
+    } catch (error) {
+        console.log('[MENU] image card failed, sending text instead:', error?.message || error)
+        await reply(body)
+    }
     break
 }
 
         case 'allmenu': {
-            await conn.relayMessage(
-        m.chat,
-        {
-            buttonsMessage: {
-                locationMessage: {
-                    degreesLatitude: 0,
-                    degreesLongitude: 0,
-                    name: 'bigbrothercode',
-                    address: 'bigbrothercode',
-                    jpegThumbnail: thumb
-                },
-                contentText: `*ALL MENU*
-
-MAIN MENU
-• menu
-• ping
-• info
-• owner
-• myjid
-
- STICKER MENU
- • sticker
- • s
-
- MEDIA MENU
- • song <judul/link>
- • play <judul/link>
- • shazam (reply audio/video)
-
- OWNER MENU
-• addowner
-• delowner
-• addprem
-• delprem
-• eval`,
-                footerText: 'bigbrothercode Bot',
-                buttons: [
-                    {
-                        buttonId: 'menu',
-                        buttonText: {
-                            displayText: 'Back Menu'
-                        },
-                        type: 1
-                    },
-                    {
-                        buttonId: 'owner',
-                        buttonText: {
-                            displayText: 'Owner Menu'
-                        },
-                        type: 1
-                    }
-                ],
-                headerType: 6
+            const body = allMenuText()
+            try {
+                await sendImageCard(body)
+            } catch (error) {
+                console.log('[MENU] image card failed, sending text instead:', error?.message || error)
+                await reply(body)
             }
-        },
-        {
-            quoted: m,
-            messageId: conn.generateMessageTag()
+            break
         }
-    )
-    break
-}
 
             case 'owner':
             case 'cekowner': {
                 const creator = isCreator(m);
                 const owner = isOwner(m);
-                const status = creator ? '👑 Kamu adalah CREATOR' : owner ? '✅ Kamu adalah OWNER' : '❌ Kamu bukan owner';
-                const info = `JID mu: ${m.sender}\nCreator: ${config.ownerNumber}@s.whatsapp.net`;
+                const status = creator ? '👑 You are the CREATOR' : owner ? '✅ You are an OWNER' : '❌ You are not an owner';
+                const info = `Your JID: ${m.sender}\nCreator: ${config.ownerNumber}@s.whatsapp.net`;
                 await reply(`${status}\n\n${info}`);
                 break;
             }
 
             case 'myjid':
-                await reply(`JID kamu: ${m.sender}`);
+                await reply(`Your JID: ${m.sender}`);
                 break;
 
             case 'ping': {
                 const start = Date.now();
-                const sent = await reply('Mengukur ping...');
+                const sent = await reply('Measuring ping...');
                 const latency = Date.now() - start;
                 const totalMem = (os.totalmem() / 1024 / 1024 / 1024).toFixed(2);
                 const freeMem = (os.freemem() / 1024 / 1024 / 1024).toFixed(2);
                 const uptimeHours = (os.uptime() / 3600).toFixed(2);
                 const cpuModel = os.cpus()[0]?.model || 'Unknown';
                 const cpuCores = os.cpus().length;
-                const vpsText = `DATA VPS\n- Hostname: ${os.hostname()}\n- Platform: ${os.platform()} ${os.arch()}\n- Uptime: ${uptimeHours} jam\n- RAM: ${freeMem} GB / ${totalMem} GB (Free/Total)\n- CPU: ${cpuCores} Core, ${cpuModel.substring(0, 30)}`;
+                const vpsText = `VPS DATA\n- Hostname: ${os.hostname()}\n- Platform: ${os.platform()} ${os.arch()}\n- Uptime: ${uptimeHours} hours\n- RAM: ${freeMem} GB / ${totalMem} GB (Free/Total)\n- CPU: ${cpuCores} Core, ${cpuModel.substring(0, 30)}`;
                 await conn.sendMessage(m.chat, { text: `Pong! ${latency} ms\n\n${vpsText}`, edit: sent.key });
                 break;
             }
 
             case 'info': {  
-                await reply(`INFO PESAN\n\nJID Pengirim: ${m.sender}\nJID Chat: ${m.chat}\nGrup: ${m.isGroup ? 'Ya' : 'Tidak'}\nDari Bot: ${m.fromMe ? 'Ya' : 'Tidak'}\nID Pesan: ${m.id || '-'}\nTeks: ${m.text || '-'}`);
+                await reply(`MESSAGE INFO\n\nSender JID: ${m.sender}\nChat JID: ${m.chat}\nGroup: ${m.isGroup ? 'Yes' : 'No'}\nFrom Bot: ${m.fromMe ? 'Yes' : 'No'}\nMessage ID: ${m.id || '-'}\nText: ${m.text || '-'}`);
                 break;
             }
 
             case 'sticker':
             case 's': {
-                if (!m.quoted && !args[0]) return reply('Reply gambar/video atau kirim URL dengan .sticker <url>');
+                if (!m.quoted && !args[0]) return reply('Reply to an image/video or send a URL with .sticker <url>');
                 let mediaBuffer;
                 if (m.quoted && (m.quoted.mtype === 'imageMessage' || m.quoted.mtype === 'videoMessage')) {
                     mediaBuffer = await m.quoted.download();
                 } else if (args[0] && args[0].match(/https?:\/\//)) {
                     const res = await fetch(args[0]);
                     mediaBuffer = Buffer.from(await res.arrayBuffer());
-                } else return reply('Format tidak dikenal. Reply media atau kirim URL.');
-                if (!mediaBuffer) return reply('Gagalo mengambil media.');
+                } else return reply('Unrecognised format. Reply to media or send a URL.');
+                if (!mediaBuffer) return reply('Failed to fetch media.');
                 const type = await fileTypeFromBuffer(mediaBuffer);
-                if (!type || (!/image/.test(type.mime) && !/video/.test(type.mime))) return reply('Hanya gambar atau video yang didukung.');
-                await reply('Membuat stiker...');
+                if (!type || (!/image/.test(type.mime) && !/video/.test(type.mime))) return reply('Only images and videos are supported.');
+                await reply('Creating sticker...');
                 try {
                     const stickerBuffer = await writeExif(mediaBuffer, { packname: 'Sticker Bot', author: 'bigbrothercode', cropToSquare: false });
                     await conn.sendMessage(m.chat, { sticker: stickerBuffer }, { quoted: m });
                 } catch (err) {
                     console.error(err);
-                    await reply('Gagal membuat stiker: ' + err.message);
+                    await reply('Failed to create sticker: ' + err.message);
                 }
                 break;
             }
@@ -436,23 +432,23 @@ MAIN MENU
             case 'play': {
                 const query = args.join(' ').trim();
                 if (!query) {
-                    return reply(`🎵 *SONG DOWNLOADER*\n\nContoh:\n${config.prefix || '.'}song Burna Boy - Last Last\n${config.prefix || '.'}song https://youtu.be/qrO4YZeyl0I\n\nBisa juga kirim link YouTube langsung.`);
+                    return reply(`🎵 *SONG DOWNLOADER*\n\nExample:\n${config.prefix || '.'}song Burna Boy - Last Last\n${config.prefix || '.'}song https://youtu.be/qrO4YZeyl0I\n\nYou can also send a YouTube link directly.`);
                 }
-                if (query.length > 150) return reply('Query terlalu panjang (maksimal 150 karakter).');
+                if (query.length > 150) return reply('Query is too long (150 characters max).');
 
-                await reply('🔎 Mencari di YouTube...');
+                await reply('🔎 Searching YouTube...');
 
                 let song;
                 try {
                     song = await resolveSong(query);
                 } catch (error) {
-                    return reply(`❌ ${error?.message || 'Pencarian YouTube gagal.'}`);
+                    return reply(`❌ ${error?.message || 'YouTube search failed.'}`);
                 }
 
-                await reply(`🎵 *${song.title}*\n👤 ${song.author}${song.duration ? `\n⏱️ ${song.duration}` : ''}\n\n⏳ Mengunduh audio...`);
+                await reply(`🎵 *${song.title}*\n👤 ${song.author}${song.duration ? `\n⏱️ ${song.duration}` : ''}\n\n⏳ Downloading audio...`);
 
                 const audio = await downloadSongAudio(song.url);
-                if (!audio.status) return reply(`❌ Gagal mengunduh audio.\n\n${audio.error}`);
+                if (!audio.status) return reply(`❌ Failed to download audio.\n\n${audio.error}`);
 
                 await sendSongAudio(conn, m, audio, song.title);
                 break;
@@ -467,115 +463,153 @@ MAIN MENU
                         : null;
 
                 if (!media) {
-                    return reply(`🎧 *SHAZAM*\n\nReply audio, voice note, atau video dengan ${config.prefix || '.'}shazam untuk mengenali lagunya.`);
+                    return reply(`🎧 *SHAZAM*\n\nReply to an audio message, voice note, or video with ${config.prefix || '.'}shazam to identify the song.`);
                 }
 
-                await reply('🎧 Menganalisa audio...');
+                await reply('🎧 Analysing audio...');
 
                 let mediaBuffer;
                 try {
                     mediaBuffer = await media.download();
                 } catch (error) {
-                    return reply(`❌ Gagal mengambil media: ${error?.message || error}`);
+                    return reply(`❌ Failed to fetch media: ${error?.message || error}`);
                 }
-                if (!mediaBuffer?.length) return reply('❌ Media kosong atau gagal diunduh.');
+                if (!mediaBuffer?.length) return reply('❌ Media is empty or failed to download.');
 
                 const match = await shazam.identify(mediaBuffer);
                 if (!match.ok) return reply(`❌ ${match.message}`);
 
                 await reply(shazam.formatMatch(match));
-                await reply('⏳ Mencari & mengunduh lagunya...');
+                await reply('⏳ Searching and downloading the song...');
 
                 try {
                     const found = await resolveSong(match.query);
                     const audio = await downloadSongAudio(found.url);
-                    if (!audio.status) return reply(`⚠️ Lagu dikenali, tapi audio gagal diunduh.\n\n${audio.error}`);
+                    if (!audio.status) return reply(`⚠️ Song identified, but the audio download failed.\n\n${audio.error}`);
                     await sendSongAudio(conn, m, audio, found.title);
                 } catch (error) {
-                    await reply(`⚠️ Lagu dikenali, tapi audio tidak bisa diunduh otomatis.\n${error?.message || error}`);
+                    await reply(`⚠️ Song identified, but the audio could not be downloaded automatically.\n${error?.message || error}`);
                 }
                 break;
             }
 
             case 'addowner': {
-                if (!isCreator(m)) return reply('Khusus creator');
+                if (!isCreator(m)) return reply('Creator only');
                 let target = args[0];
                 if (m.mentionedJid?.[0]) target = m.mentionedJid[0];
-                if (!target) return reply('Contoh: .addowner 628xxx');
+                if (!target) return reply('Example: .addowner 628xxx');
                 const ownerDB = readJSON(ownerPath);
                 const num = getNumber(target);
-                if (ownerDB.includes(num)) return reply('Sudah jadi owner');
+                if (ownerDB.includes(num)) return reply('Already an owner');
                 ownerDB.push(num);
                 saveJSON(ownerPath, ownerDB);
-                reply(`Berhasil add owner\n${num}`);
+                reply(`Owner added\n${num}`);
                 break;
             }
 
             case 'delowner': {
-                if (!isCreator(m)) return reply('Khusus creator');
+                if (!isCreator(m)) return reply('Creator only');
                 let target = args[0];
                 if (m.mentionedJid?.[0]) target = m.mentionedJid[0];
-                if (!target) return reply('Contoh: .delowner 628xxx');
+                if (!target) return reply('Example: .delowner 628xxx');
                 const ownerDB = readJSON(ownerPath);
                 const num = getNumber(target);
                 const filtered = ownerDB.filter(v => v !== num);
                 saveJSON(ownerPath, filtered);
-                reply(`Berhasil del owner\n${num}`);
+                reply(`Owner removed\n${num}`);
                 break;
             }
 
             case 'addprem': {
-                if (!isOwner(m)) return reply('Khusus owner');
+                if (!isOwner(m)) return reply('Owner only');
                 let target = args[0];
                 if (m.mentionedJid?.[0]) target = m.mentionedJid[0];
-                if (!target) return reply('Contoh: .addprem 628xxx');
+                if (!target) return reply('Example: .addprem 628xxx');
                 const premiumDB = readJSON(premiumPath);
                 const num = getNumber(target);
-                if (premiumDB.includes(num)) return reply('Sudah premium');
+                if (premiumDB.includes(num)) return reply('Already premium');
                 premiumDB.push(num);
                 saveJSON(premiumPath, premiumDB);
-                reply(`Berhasil add premium\n${num}`);
+                reply(`Premium added\n${num}`);
                 break;
             }
 
             case 'delprem': {
-                if (!isOwner(m)) return reply('Khusus owner');
+                if (!isOwner(m)) return reply('Owner only');
                 let target = args[0];
                 if (m.mentionedJid?.[0]) target = m.mentionedJid[0];
-                if (!target) return reply('Contoh: .delprem 628xxx');
+                if (!target) return reply('Example: .delprem 628xxx');
                 const premiumDB = readJSON(premiumPath);
                 const num = getNumber(target);
                 const filtered = premiumDB.filter(v => v !== num);
                 saveJSON(premiumPath, filtered);
-                reply(`Berhasil del premium\n${num}`);
+                reply(`Premium removed\n${num}`);
                 break;
             }
 
             case 'eval': {
-                if (!isCreator(m)) return reply('Khusus creator');
+                if (!isCreator(m)) return reply('Creator only');
                 const code = args.join(' ');
-                if (!code) return reply('Contoh:\n.eval 1+1');
+                if (!code) return reply('Example:\n.eval 1+1');
                 await executeEval(code, conn, m);
                 break;
             }
             
+           case 'antipromote':
+           case 'antidemote': {
+    if (!m.isGroup) return m.reply('This command only works in groups.');
+
+    let meta = null;
+    try { meta = await conn.groupMetadata(m.chat); } catch {}
+    const isAdmin = isGroupAdminOf(meta?.participants, m.sender);
+    if (!isAdmin && !isOwner(m)) return m.reply('Group admins only.');
+
+    const file = path.join(__dirname, 'database', 'antiactions.json');
+    const db = readJSONObject(file);
+    const gid = m.chat;
+    db[gid] = db[gid] && typeof db[gid] === 'object' ? db[gid] : {};
+
+    const key = command; // 'antipromote' | 'antidemote'
+    const arg = (args[0] || '').toLowerCase();
+
+    if (arg === 'on' || arg === 'off') {
+        db[gid][key] = arg === 'on';
+        saveJSON(file, db);
+
+        // The revert needs admin rights, so say it now instead of failing silently later.
+        const botIsAdmin = isGroupAdminOf(meta?.participants, conn.user?.id);
+        const warning = arg === 'on' && !botIsAdmin
+            ? '\n\n⚠️ The bot is not a group admin — changes cannot be reverted until it is.'
+            : '';
+        return m.reply(`✅ *${key}* is now *${arg.toUpperCase()}* for this group.${warning}`);
+    }
+
+    const current = db[gid][key] ? 'ON' : 'OFF';
+    return m.reply(
+        `*${key}*: ${current}\n\n` +
+        `Usage:\n` +
+        `• ${config.prefix || '.'}${key} on  → enable\n` +
+        `• ${config.prefix || '.'}${key} off → disable`
+    );
+}
+
            case 'public': {
-    if (!isOwner(m)) return reply('Khusus owner')
+    if (!isOwner(m)) return reply('Owner only')
 
     config.mode = 'public'
     fs.writeFileSync('./fig.json', JSON.stringify(config, null, 2))
 
-    reply('Berhasil ganti mode ke public')
+    reply('Mode switched to public')
 }
            break
 
            case 'self': {
-    if (!isOwner(m)) return reply('Khusus owner')
+    if (!isOwner(m)) return reply('Owner only')
 
     config.mode = 'self'
     fs.writeFileSync('./fig.json', JSON.stringify(config, null, 2))
 
-    reply('Berhasil ganti mode ke self')
+    reply('Mode switched to self')
 }
            break
            
