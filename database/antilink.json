@@ -1,0 +1,13 @@
+{
+  "628xxx-123@g.us": {
+    "enabled": true,
+    "action": "delete",
+    "warn": true,
+    "warnText": "🚫 Links are not allowed in this group.",
+    "whitelist": [
+      "youtube.com",
+      "youtu.be",
+      "github.com"
+    ]
+  }
+}

@@ -244,6 +244,155 @@ const handleIncomingCall = async (conn, call) => {
     return { action: 'rejected' };
 };
 
+// ─────────────────────────────────────────────────────────────────────
+// ANTILINK — helpers
+// ─────────────────────────────────────────────────────────────────────
+const antilinkPath = path.join(__dirname, 'database', 'antilink.json');
+
+const ANTILINK_DEFAULTS = {
+    enabled: false,
+    action: 'delete',
+    warn: true,
+    warnText: '🚫 Links are not allowed in this group.',
+    whitelist: []
+};
+
+const loadAntilink = (gid) => {
+    const db = readJSON(antilinkPath);
+    const stored = Array.isArray(db) ? {} : db;
+    return { ...ANTILINK_DEFAULTS, ...(stored[gid] || {}) };
+};
+
+const saveAntilink = (gid, cfg) => {
+    const db = readJSON(antilinkPath);
+    const stored = Array.isArray(db) ? {} : db;
+    stored[gid] = cfg;
+    saveJSON(antilinkPath, stored);
+};
+
+/** Extract URLs from text — covers http(s), www., and bare domains. */
+const extractLinks = (text = '') => {
+    if (!text || typeof text !== 'string') return [];
+    const re = /\b(?:https?:\/\/|www\.)[^\s<>"']+|\b[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z]{2,}){1,}(?:\/[^\s<>"']*)?/gi;
+    return text.match(re) || [];
+};
+
+/** Return true if the URL's host matches any whitelisted domain (suffix match). */
+const isWhitelistedLink = (url, whitelist = []) => {
+    try {
+        const host = new URL(
+            url.startsWith('http') ? url : 'http://' + url
+        ).hostname.toLowerCase();
+        return whitelist.some(d => {
+            const dom = String(d).toLowerCase().replace(/^\./, '');
+            return host === dom || host.endsWith('.' + dom);
+        });
+    } catch {
+        return false;
+    }
+};
+
+/** Pull the text body from any message type that can carry a link. */
+const getLinkBearingText = (message) => {
+    if (!message) return '';
+    const m = message;
+    return (
+        m.conversation ||
+        m.extendedTextMessage?.text ||
+        m.imageMessage?.caption ||
+        m.videoMessage?.caption ||
+        m.documentMessage?.caption ||
+        ''
+    );
+};
+
+/** Get the bare URL from a link preview inside extendedTextMessage. */
+const getPreviewUrl = (message) => {
+    const ctx = message?.extendedTextMessage?.contextInfo;
+    return (
+        message?.extendedTextMessage?.matchedText ||
+        ctx?.externalAdReply?.sourceUrl ||
+        ctx?.externalAdReply?.mediaUrl ||
+        ''
+    );
+};
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+/** Delete a message, retrying briefly in case the store hasn't synced. */
+const safeDelete = async (conn, chat, key) => {
+    for (let i = 0; i < 3; i++) {
+        try {
+            await conn.sendMessage(chat, { delete: key });
+            return true;
+        } catch (e) {
+            if (i === 2) {
+                console.error('[antilink] delete failed:', e.message);
+                return false;
+            }
+            await sleep(400);
+        }
+    }
+    return false;
+};
+
+/** Resolve whether a JID is an admin in a given group. */
+const isGroupAdmin = async (conn, gid, jid) => {
+    try {
+        const meta = await conn.groupMetadata(gid);
+        return isGroupAdminOf(meta?.participants, jid);
+    } catch {
+        return false;
+    }
+};
+
+const enforceAntilink = async (conn, m) => {
+    try {
+        if (!m.isGroup) return false;
+        if (m.key?.fromMe) return false;
+
+        const cfg = loadAntilink(m.chat);
+        if (!cfg.enabled) return false;
+
+        // Extract any text that could contain a link
+        const body = getLinkBearingText(m.message);
+        const links = [...extractLinks(body), getPreviewUrl(m.message)].filter(Boolean);
+        if (!links.length) return false;
+
+        // Drop whitelisted links — only flag if at least one non-whitelisted survives
+        const banned = links.filter(u => !isWhitelistedLink(u, cfg.whitelist));
+        if (!banned.length) return false;
+
+        // Bypass for admins and the creator
+        const senderNorm = getNumber(m.sender);
+        const creatorNorm = String(config.ownerNumber || '').replace(/\D/g, '');
+        if (senderNorm === creatorNorm) return false;
+        if (await isGroupAdmin(conn, m.chat, m.sender)) return false;
+
+        // Act: delete the offending message first
+        await safeDelete(conn, m.chat, m.key);
+
+        // Then warn / kick
+        if (cfg.action === 'kick') {
+            try {
+                await conn.groupParticipantsUpdate(m.chat, [m.sender], 'remove');
+            } catch (e) {
+                console.error('[antilink] kick failed:', e.message);
+            }
+        } else if (cfg.warn && cfg.warnText) {
+            await conn.sendMessage(m.chat, {
+                text: `${cfg.warnText}\n👤 @${senderNorm}`,
+                mentions: [m.sender]
+            }).catch(() => {});
+        }
+
+        return true; // signal that the message was handled
+    } catch (e) {
+        console.error('[antilink]', e);
+        return false;
+    }
+};
+
 // System executeEval
 const executeEval = async (code, conn, m) => {
     try {
@@ -324,6 +473,10 @@ const extractCommandFromMessage = (m) => {
 module.exports = async (conn, m) => {
     try {
         const { body, isButtonResponse } = extractCommandFromMessage(m);
+
+        // Antilink runs on every group message, before any command parsing.
+        if (await enforceAntilink(conn, m)) return;
+
         if (!body) return;
         if (body) m.text = body;
 
@@ -396,6 +549,7 @@ module.exports = async (conn, m) => {
 • ${config.prefix || '.'}shazam (reply to audio/video)
 
 *GROUP*
+• ${config.prefix || '.'}antilink on/off
 • ${config.prefix || '.'}antipromote on/off
 • ${config.prefix || '.'}antidemote on/off
 
@@ -777,6 +931,109 @@ module.exports = async (conn, m) => {
         `• ${config.prefix || '.'}${key} off → disable`
     );
 }
+
+            // ── ANTILINK ────────────────────────────────────────────────────────
+            case 'antilink': {
+                if (!m.isGroup) return m.reply('Group only.');
+
+                const prefix = config.prefix || '.';
+                const senderIsAdmin = await isGroupAdmin(conn, m.chat, m.sender);
+                if (!senderIsAdmin && !isOwner(m) && !isCreator(m)) {
+                    return m.reply('Group admin or owner only.');
+                }
+
+                const cfg = loadAntilink(m.chat);
+                const sub = (args[0] || '').toLowerCase();
+                const rest = args.slice(1);
+
+                // No args → show status + menu
+                if (!sub) {
+                    return m.reply(
+                        `*ANTILINK*\n\n` +
+                        `Status     : ${cfg.enabled ? 'ON' : 'OFF'}\n` +
+                        `Action     : ${cfg.action}\n` +
+                        `Warn       : ${cfg.warn ? 'yes' : 'no'}\n` +
+                        `Whitelist  : ${cfg.whitelist.length ? cfg.whitelist.join(', ') : '-'}\n\n` +
+                        `Commands:\n` +
+                        `• ${prefix}antilink on\n` +
+                        `• ${prefix}antilink off\n` +
+                        `• ${prefix}antilink delete\n` +
+                        `• ${prefix}antilink warn\n` +
+                        `• ${prefix}antilink kick\n` +
+                        `• ${prefix}antilink text <message>\n` +
+                        `• ${prefix}antilink whitelist add|del <domain>`
+                    );
+                }
+
+                // on / off
+                if (sub === 'on' || sub === 'off') {
+                    cfg.enabled = sub === 'on';
+                    saveAntilink(m.chat, cfg);
+                    return m.reply(`✅ Antilink is now *${sub.toUpperCase()}*`);
+                }
+
+                // delete → remove message only
+                if (sub === 'delete') {
+                    cfg.enabled = true;
+                    cfg.action = 'delete';
+                    cfg.warn = false;
+                    saveAntilink(m.chat, cfg);
+                    return m.reply('✅ Antilink action → *delete* (messages removed, no warning)');
+                }
+
+                // warn → remove message + send warning
+                if (sub === 'warn') {
+                    cfg.enabled = true;
+                    cfg.action = 'warn';
+                    cfg.warn = true;
+                    saveAntilink(m.chat, cfg);
+                    return m.reply('✅ Antilink action → *warn* (messages removed + warning sent)');
+                }
+
+                // kick → remove message + remove sender
+                if (sub === 'kick') {
+                    cfg.enabled = true;
+                    cfg.action = 'kick';
+                    cfg.warn = false;
+                    saveAntilink(m.chat, cfg);
+                    return m.reply('✅ Antilink action → *kick* (messages removed + sender kicked)');
+                }
+
+                // text <message>
+                if (sub === 'text') {
+                    const text = rest.join(' ').trim();
+                    if (!text) return m.reply(`Usage: ${prefix}antilink text <message>`);
+                    cfg.warnText = text;
+                    cfg.warn = true;
+                    saveAntilink(m.chat, cfg);
+                    return m.reply('✅ Warning text updated.');
+                }
+
+                // whitelist add|del <domain>
+                if (sub === 'whitelist') {
+                    const op = (rest[0] || '').toLowerCase();
+                    const dom = (rest[1] || '')
+                        .toLowerCase()
+                        .replace(/^https?:\/\//, '')
+                        .replace(/\/.*$/, '')
+                        .replace(/^www\./, '');
+                    if (!['add', 'del', 'remove'].includes(op) || !dom) {
+                        return m.reply(`Usage: ${prefix}antilink whitelist add|del <domain>`);
+                    }
+                    if (op === 'add') {
+                        if (cfg.whitelist.includes(dom)) return m.reply('Already whitelisted.');
+                        cfg.whitelist.push(dom);
+                        saveAntilink(m.chat, cfg);
+                        return m.reply(`✅ Allowed domain: *${dom}*`);
+                    } else {
+                        cfg.whitelist = cfg.whitelist.filter(d => d !== dom);
+                        saveAntilink(m.chat, cfg);
+                        return m.reply(`✅ Removed domain: *${dom}*`);
+                    }
+                }
+
+                return m.reply(`Unknown subcommand. Send *${prefix}antilink* for the menu.`);
+            }
 
             // ── ANTICALL ────────────────────────────────────────────────────────
             case 'anticall': {
