@@ -38,3 +38,7 @@ sessions/
 # Local secret configuration
 config.js
 api.js
+
+# Panel link token written by lib/nexus-bridge.js after the first pair.
+# It authenticates this bot to the dashboard, so it is a credential.
+.nexus-token.json

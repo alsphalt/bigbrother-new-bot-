@@ -49,6 +49,7 @@ const telegramPairing = require('./lib/telegram-pairing.js')
 const sessionStore = require('./lib/session.js')
 const sessionRegistry = require('./lib/sessions.js')
 const { createBotInstance } = require('./lib/bot-instance.js')
+const nexusBridge = require('./lib/nexus-bridge.js')
 
 runtimeMonitor.installGuards()
 runtimeMonitor.startMonitor()
@@ -1493,6 +1494,62 @@ async function startSocket() {
 }
 
 /*
+ * NEXUS PANEL BRIDGE.
+ *
+ * The website owns pairing requests and command delivery; this process owns the
+ * sockets. These callbacks are the entire contract between them — no shared
+ * files, no shared session credentials, no second socket.
+ */
+async function nexusRestartSession(sessionId) {
+    const id = String(sessionId || 'main')
+    if (id === sessionRegistry.PRIMARY_ID || id === 'main') {
+        await connectToWhatsApp()
+        return { ok: true }
+    }
+    const record = sessionRegistry.get(id)
+    if (!record) return { ok: false, error: 'unknown session' }
+    const live = secondaryInstances.get(id)
+    if (live?.stop) {
+        try { live.stop() } catch { }
+    }
+    secondaryInstances.delete(id)
+    await startSecondarySession(record)
+    return { ok: true }
+}
+
+async function nexusLogoutSession(sessionId) {
+    const id = String(sessionId || '')
+    if (!id) return { ok: false, error: 'no session selected' }
+    if (id === sessionRegistry.PRIMARY_ID || id === 'main') {
+        // The primary auth folder is the bot's own login: unlinking it from a
+        // website click would lock the owner out with no way back in.
+        return { ok: false, error: 'the primary session cannot be unlinked remotely' }
+    }
+    const live = secondaryInstances.get(id)
+    if (live) {
+        try { if (typeof live.conn?.logout === 'function') await live.conn.logout() } catch { }
+        try { live.stop?.() } catch { }
+        secondaryInstances.delete(id)
+    }
+    const removed = sessionRegistry.remove(id)
+    return removed?.ok === false ? { ok: false, error: removed.error || 'could not remove' } : { ok: true }
+}
+
+const nexus = nexusBridge.createBridge({
+    pair: (phone) => pairFromPanel(phone),
+    restart: nexusRestartSession,
+    logout: nexusLogoutSession,
+    sessions: () => sessionRegistry.all().map(record => ({
+        externalId: String(record.id),
+        label: record.label || `+${record.phone || ''}`,
+        phone: record.phone || '',
+        state: record.state || (record.id === sessionRegistry.PRIMARY_ID && runtimeMonitor.currentSocket('main')?.__darknoteConnectionState === 'open' ? 'CONNECTED' : 'DISCONNECTED'),
+        lastError: record.lastError || '',
+        lastConnectedAt: record.lastConnectedAt || 0
+    }))
+})
+
+/*
  * BOOT ORDER MATTERS.
  *
  * Telegram is started FIRST so it can claim pairing before the socket reaches
@@ -1504,6 +1561,9 @@ async function startSocket() {
     connectToWhatsApp().catch(error => {
         console.error('❌ Initial connect failed:', error?.message || error)
     })
+
+    // Panel link is optional and must never block or crash the WhatsApp path.
+    nexus.start().catch(error => console.error('[NEXUS] bridge failed to start:', error?.message || error))
 
     // Keep the existing panel terminal and add pairing controls without
     // changing the bot's WhatsApp command/menu style.

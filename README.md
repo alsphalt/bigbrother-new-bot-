@@ -61,3 +61,37 @@ Covers: phone/email verification (wrong code, single-use), session + profile, re
 - Bet Mode is an entry stub; real-money wagering is disabled until legal/compliance is defined.
 - The 3D Table theme is a stylized 2.5D renderer in this build; a full Three.js table is the planned enhancement.
 - Full product spec: `DARKNOTE-SPEC.md` (sections §1–§30 map to this implementation).
+
+## Link this bot to the Darknote panel (optional)
+
+The bot stays independent: it keeps its own WhatsApp sockets and credentials.
+The only connection to the website is a small bridge in
+`whatsapp-bot/lib/nexus-bridge.js`, which reports status and takes pairing
+requests. Nothing is shared except a bot token.
+
+1. In the panel: **Bots → create a bot → Pair** → copy the 8-character code.
+2. Start the bot with:
+
+   ```bash
+   NEXUS_URL="https://your-panel.vercel.app" \
+   NEXUS_PAIR_CODE="ABCD1234" \
+   node index.js
+   ```
+
+   The code is exchanged once for a `dnx_…` token, saved to
+   `whatsapp-bot/.nexus-token.json` (gitignored, mode 600). Remove
+   `NEXUS_PAIR_CODE` afterwards; later starts reuse the token.
+
+3. In the panel: **WhatsApp → Add session → choose this bot → Pair**. The
+   dashboard shows the code the bot issued; enter it on the phone.
+
+Every 15 seconds (`NEXUS_SYNC_SECONDS`) the bridge sends a heartbeat and a
+session snapshot, so the panel marks the bot **ONLINE**, shows its version and
+streams the same log lines. `Restart` and `Unlink` from the dashboard are
+delivered as commands and acked. If the panel is unreachable the bridge only
+logs and retries - WhatsApp keeps running. If the token is revoked the bridge
+stops and says so instead of retrying forever.
+
+Environment: `NEXUS_URL`, `NEXUS_TOKEN` (or `NEXUS_PAIR_CODE`),
+`NEXUS_SYNC_SECONDS` (default 15, min 5), `NEXUS_ENABLED=false` to disable.
+Do not commit `.nexus-token.json`.
