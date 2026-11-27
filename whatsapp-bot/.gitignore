@@ -44,3 +44,22 @@ sessions/
 # Panel link token written by lib/nexus-bridge.js after the first pair.
 # It authenticates this bot to the dashboard, so it is a credential.
 .nexus-token.json
+
+# Runtime leftovers that used to be covered by the repository-root .gitignore.
+auth.dead-*/
+sessions.dead-*/
+.stdin.fifo
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Reproducible with npm install
+vendor/
