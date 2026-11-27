@@ -35,9 +35,11 @@ auth_tg_*/
 # per session.
 sessions/
 
-# Local secret configuration
-config.js
-api.js
+# Local secret configuration. These two patterns used to swallow the bot's own
+# modules (whatsapp-bot/api.js and ai/config.js), so a fresh clone crashed on
+# boot with MODULE_NOT_FOUND. Ignore only a root-level secrets file now.
+/config.js
+!ai/config.js
 
 # Panel link token written by lib/nexus-bridge.js after the first pair.
 # It authenticates this bot to the dashboard, so it is a credential.

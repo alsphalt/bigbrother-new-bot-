@@ -4,6 +4,10 @@
  * Please keep this credit notice in redistributed versions.
  * © DARKNOTE
  */
+// Load .env before any module reads process.env (NEXUS_*, TELEGRAM_*, provider
+// keys). Node does not do this automatically and there is no dotenv dependency.
+try { require('./ai/config').loadEnvOnce() } catch (error) { console.error('[ENV] load failed:', error?.message || error) }
+
 const fs = require('fs')
 const path = require('path')
 const { default: makeWASocket, useMultiFileAuthState, makeCacheableSignalKeyStore, DisconnectReason, Browsers, jidNormalizedUser } = require('mzazibaileys')
