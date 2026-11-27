@@ -50,6 +50,17 @@ international format, and pick this bot as the agent. The panel queues the
 request; the bot polls it, calls WhatsApp's real `requestPairingCode`, and the
 code appears in the dashboard within one sync cycle (~10s).
 
+### Event stream (instant pairing)
+
+After the first sync the bot opens `GET /api/bot/v1/stream` and keeps it open.
+The website pushes a frame the moment the owner submits a number, so the bot
+pairs immediately instead of waiting for the next poll; the 10 s poll stays as a
+fallback. Measured end to end: **0.9–1.7 s** from form submit to code on screen,
+and **~4 s** for a request queued while the bot was offline.
+
+The stream carries no secrets — only `pairing` / `command` / `sync` notices.
+If it drops, the bot reconnects every 2.5 s and the poll still runs.
+
 The code is branded: `config.json → pairingCode` (`DARKNOTE`) is a valid
 8-character code that the Baileys fork registers with WhatsApp. Set it to `""`
 to let WhatsApp generate a random one.

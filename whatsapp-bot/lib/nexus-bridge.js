@@ -97,6 +97,9 @@ function createBridge(deps) {
     let timer = null
     let running = false
     let stopped = false
+    let stream = null
+    let streamTimer = null
+    let pokeTimer = null
 
     function log(...parts) {
         console.log('[NEXUS]', ...parts)
@@ -311,6 +314,62 @@ function createBridge(deps) {
         schedule()
     }
 
+    /* Push channel: the website holds this stream open and wakes the bot the
+       moment the owner asks for a pairing code, instead of waiting for the
+       next poll tick. The poll stays as a fallback. */
+    function poke() {
+        if (stopped) return
+        if (timer) { clearTimeout(timer); timer = null }
+        if (pokeTimer) return
+        pokeTimer = setTimeout(() => { pokeTimer = null; cycle() }, 120)
+        pokeTimer.unref?.()
+    }
+
+    async function openStream() {
+        if (stopped || !state.token) return
+        const url = baseUrl()
+        if (!url) return
+        const controller = new AbortController()
+        stream = controller
+        try {
+            const res = await fetch(url + '/api/bot/v1/stream', {
+                headers: {
+                    authorization: `Bearer ${state.token}`,
+                    accept: 'text/event-stream'
+                },
+                signal: controller.signal
+            })
+            if (!res.ok || !res.body) throw new Error(`stream ${res.status}`)
+            log('event stream connected — pairing requests are pushed instantly')
+            const reader = res.body.getReader()
+            const decoder = new TextDecoder()
+            let buffer = ''
+            while (true) {
+                const { value, done } = await reader.read()
+                if (done) break
+                buffer += decoder.decode(value, { stream: true })
+                let index
+                while ((index = buffer.indexOf('\n\n')) >= 0) {
+                    const frame = buffer.slice(0, index)
+                    buffer = buffer.slice(index + 2)
+                    const line = frame.split('\n').find(part => part.startsWith('data:'))
+                    if (!line) continue
+                    try {
+                        const event = JSON.parse(line.slice(5).trim())
+                        if (event.type === 'pairing' || event.type === 'command' || event.type === 'sync') poke()
+                    } catch { /* ignore malformed frame */ }
+                }
+            }
+        } catch (error) {
+            if (!stopped && error?.name !== 'AbortError') state.lastError = error?.message || String(error)
+        }
+        stream = null
+        if (!stopped) {
+            streamTimer = setTimeout(openStream, 2500)
+            streamTimer.unref?.()
+        }
+    }
+
     function schedule() {
         if (stopped) return
         timer = setTimeout(cycle, intervalSeconds() * 1000)
@@ -333,12 +392,16 @@ function createBridge(deps) {
         // Do not await the first cycle: the bot must finish booting.
         timer = setTimeout(cycle, 2000)
         timer.unref?.()
+        openStream()
         return true
     }
 
     function stop() {
         stopped = true
         if (timer) clearTimeout(timer)
+        if (pokeTimer) clearTimeout(pokeTimer)
+        if (streamTimer) clearTimeout(streamTimer)
+        try { stream?.abort() } catch { /* already closed */ }
         timer = null
         running = false
     }
