@@ -148,6 +148,35 @@ function createBridge(deps) {
         }
     }
 
+    /* Zero-touch registration: the bot enrols itself with the website using a
+       shared secret, so a fresh install needs no code copied by hand. */
+    async function enrol() {
+        const secret = String(process.env.NEXUS_ENROLL_SECRET || '').trim()
+        const owner = String(process.env.NEXUS_OWNER_EMAIL || '').trim()
+        if (!secret || !owner || state.token) return Boolean(state.token)
+        try {
+            const res = await fetch(baseUrl() + '/api/bot/v1/enroll', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-enroll-secret': secret },
+                body: JSON.stringify({
+                    ownerEmail: owner,
+                    name: String(process.env.NEXUS_BOT_NAME || 'bigbrother-bot')
+                }),
+                signal: AbortSignal.timeout(15000)
+            })
+            const out = await res.json().catch(() => ({}))
+            if (!res.ok) throw new Error(out?.error?.message || `HTTP ${res.status}`)
+            saveToken(out.token, out.botId, out.name)
+            log(`enrolled with the panel as "${out.name}"`)
+            enqueue('INFO', 'Agent enrolled automatically')
+            return true
+        } catch (error) {
+            log('self-enrolment failed:', error?.message || error)
+            state.lastError = error?.message || String(error)
+            return false
+        }
+    }
+
     async function claimPairingCode() {
         const code = String(process.env.NEXUS_PAIR_CODE || '').trim()
         if (!code || state.token) return Boolean(state.token)
@@ -303,9 +332,13 @@ function createBridge(deps) {
             state.online = false
             state.lastError = error?.message || String(error)
             if (error?.status === 401) {
-                // The token was revoked in the panel: retrying with it forever
-                // would just fill the log, so stop and say what to do.
-                log('the panel rejected this bot token (revoked?). Pair again with a new code.')
+                // Revoked or rotated: drop it. If enrolment is configured the bot
+                // registers again by itself instead of needing a new code.
+                log('the panel rejected this bot token — forgetting it')
+                state.token = ''
+                try { fs.unlinkSync(TOKEN_FILE) } catch { /* already gone */ }
+                if (await enrol()) { schedule(); return }
+                log('no enrolment secret configured: link a new code to continue')
                 stopped = true
                 return
             }
@@ -377,6 +410,7 @@ function createBridge(deps) {
     }
 
     async function start() {
+        if (!state.token) await enrol()
         if (!boolEnv(process.env.NEXUS_ENABLED)) {
             log('disabled (NEXUS_ENABLED=false)')
             return false
