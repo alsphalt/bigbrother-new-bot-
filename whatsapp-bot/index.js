@@ -1107,7 +1107,9 @@ const botApi = {
     removeSession: () => sessionStore.reset(),
     connectionState: () => runtimeMonitor.telegramState(),
     baileysVersion: () => getBaileysVersion(),
-    setPairingOwner: owner => { pairingOwner = owner === 'telegram' ? 'telegram' : 'console' },
+    setPairingOwner: owner => {
+        pairingOwner = owner === 'telegram' ? 'telegram' : (owner === 'nexus' ? 'nexus' : 'console')
+    },
     pairingOwner: () => pairingOwner
 }
 
@@ -1211,8 +1213,8 @@ async function startSocket() {
         }
     } catch { }
 
-    if (!preRegistered && pairingOwner === 'telegram') {
-        console.log('[SESSION] not paired — Telegram /pair will open a fresh pairing socket')
+    if (!preRegistered && (pairingOwner === 'telegram' || pairingOwner === 'nexus')) {
+        console.log(`[SESSION] not paired — the ${pairingOwner} panel opens a fresh pairing socket on demand`)
         return
     }
 
@@ -1556,22 +1558,41 @@ const nexus = nexusBridge.createBridge({
 /*
  * BOOT ORDER MATTERS.
  *
- * Telegram is started FIRST so it can claim pairing before the socket reaches
- * its pairing branch. If Telegram fails, pairingOwner stays 'console' and the
- * console flow runs unchanged.
+ * A website panel (NEXUS_URL) is the primary control surface; Telegram is
+ * optional and must never delay or block it.
  */
  ; (async () => {
-    await startTelegram()
+    /*
+     * PANEL-FIRST BOOT.
+     *
+     * When a website panel is configured it owns pairing, so:
+     *   - the Nexus bridge starts before anything else and never awaits;
+     *   - the unregistered boot socket is skipped (it used to open and close,
+     *     which is the crash-prone part of Baileys);
+     *   - Telegram only starts when it is actually enabled and has a token;
+     *   - the interactive console panel is not started (no stdin in a
+     *     container / Pterodactyl console).
+     * With no panel configured the previous behaviour is unchanged.
+     */
+    const nexusConfigured = Boolean((process.env.NEXUS_URL || '').trim()) &&
+        String(process.env.NEXUS_ENABLED || 'true').toLowerCase() !== 'false'
+
+    if (nexusConfigured) {
+        try { botApi.setPairingOwner('nexus') } catch { pairingOwner = 'nexus' }
+        nexus.start().catch(error => console.error('[NEXUS] bridge failed to start:', error?.message || error))
+    }
+
     connectToWhatsApp().catch(error => {
         console.error('❌ Initial connect failed:', error?.message || error)
     })
 
-    // Panel link is optional and must never block or crash the WhatsApp path.
-    nexus.start().catch(error => console.error('[NEXUS] bridge failed to start:', error?.message || error))
+    if (config.telegram?.enabled === true && (process.env.TELEGRAM_TOKEN || '').trim()) {
+        startTelegram().catch(error => console.error('[TELEGRAM] start failed:', error?.message || error))
+    }
 
-    // Keep the existing panel terminal and add pairing controls without
-    // changing the bot's WhatsApp command/menu style.
-    if (config.telegram?.enabled === false) {
+    const panelWanted = process.env.PAIR_PANEL === 'on' ||
+        (!nexusConfigured && config.telegram?.enabled === false && process.env.PAIR_PANEL !== 'off')
+    if (panelWanted) {
         setTimeout(() => { runPairingPanel().catch(error => console.error('[PANEL] pairing panel stopped:', error?.message || error)) }, 250)
     }
 

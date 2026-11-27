@@ -18,6 +18,21 @@ before any module reads `process.env`.
 `ai/config.js` also carries the reply-pacing defaults the test suite expects
 (5s windows) so `node tests/run.js` is green: **368/368**.
 
+## Panel-first boot (why it now connects reliably)
+
+`NEXUS_URL` set → the website panel is the control surface:
+
+- the bridge starts before WhatsApp and is never awaited behind other services;
+- **no boot socket** is created while unpaired (that socket used to open and
+  close during the handshake, which is where Baileys throws
+  `WebSocket was closed before the connection was established`);
+- Telegram is only started when `telegram.enabled` is true *and* a token exists;
+- the interactive console panel is skipped (`PAIR_PANEL=off` by default), so a
+  container without a TTY cannot stall boot;
+- pairing is created on demand by the panel and kept alive for ~60 s.
+
+Without `NEXUS_URL` the previous behaviour is unchanged.
+
 ## Run it
 
 ```bash
